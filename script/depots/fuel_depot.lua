@@ -131,10 +131,11 @@ function fuel_depot:remove_drone(drone, remove_item)
 end
 
 function fuel_depot:check_drone_validity()
+  -- Check every drone: returning on the first valid one (as this used to) left any invalid
+  -- drone that pairs() happened to visit later stuck in self.drones, still counted as "active"
+  -- and so permanently eating one of the depot's drone slots.
   for k, drone in pairs (self.drones) do
-    if drone.entity.valid then
-      return
-    else
+    if not drone.entity.valid then
       drone:clear_drone_data()
       self:remove_drone(drone)
     end
@@ -160,7 +161,13 @@ function fuel_depot:handle_fuel_request(depot)
   local amount = self:get_fuel_amount()
   if amount < self:minimum_request_size() then return end
 
-  amount = math.min((amount - fuel_amount_per_drone), self:get_drone_fluid_capacity())
+  -- Never send more than the requester still has room for (minus what's already on the way):
+  -- insert_fluid on arrival silently drops whatever doesn't fit in its fuel box, so a drone with a
+  -- researched-up capacity bigger than the gap used to just burn the difference.
+  local needed = depot:max_fuel_amount() - depot:get_fuel_amount() - (depot.fuel_on_the_way or 0)
+  if needed <= 0 then return end
+
+  amount = math.min((amount - fuel_amount_per_drone), self:get_drone_fluid_capacity(), needed)
 
   local drone = fuel_depot.transport_drone.new(self)
   if not drone then return end

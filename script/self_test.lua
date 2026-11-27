@@ -13,6 +13,7 @@ local gui = require("script/gui")
 local depot_common = require("script/depot_common")
 local road_network = require("script/road_network")
 local transport_drone = require("script/transport_drone")
+local drone_requests = require("script/drone_requests")
 
 local fuel_fluid = "petroleum-gas"
 local test_fluid = "water"
@@ -92,24 +93,26 @@ local check_blueprint_tags = function(player, surface, force)
   -- script.raise_event, so call the handler directly.
   depot_common.on_player_setup_blueprint({player_index = player.index})
 
-  local tagged_count = 0
-  local fuel_depot_tag
-  for index, blueprint_entity in pairs(entities) do
-    local tag = cursor.get_blueprint_entity_tag(index, "transport_depot_tags")
-    if tag then
-      tagged_count = tagged_count + 1
-      log("SELF_TEST: blueprint tag on " .. blueprint_entity.name .. " = " .. serpent.line(tag))
-      if blueprint_entity.name == "fuel-depot" then
-        fuel_depot_tag = tag
+  -- Drone counts are written as native item requests (BlueprintEntity.items), not tags.
+  local requested_count = 0
+  local fuel_depot_request
+  for index, blueprint_entity in pairs(cursor.get_blueprint_entities() or {}) do
+    for _, plan in pairs(blueprint_entity.items or {}) do
+      if plan.id and plan.id.name == "transport-drone" then
+        requested_count = requested_count + 1
+        log("SELF_TEST: blueprint drone request on " .. blueprint_entity.name .. " = " .. serpent.line(plan))
+        if blueprint_entity.name == "fuel-depot" then
+          fuel_depot_request = plan
+        end
       end
     end
   end
 
-  if tagged_count == 0 then
-    error("no depot got a transport_depot_tags blueprint tag")
+  if requested_count == 0 then
+    error("no depot got a transport-drone item request in the blueprint")
   end
-  if not fuel_depot_tag then
-    error("fuel-depot didn't get a transport_depot_tags blueprint tag")
+  if not fuel_depot_request then
+    error("fuel-depot didn't get a transport-drone item request in the blueprint")
   end
   cursor.clear()
 
@@ -713,6 +716,147 @@ end
 -- "tutorial-flying-text" entity - a prototype that no longer exists in 2.x, so the whole save died
 -- with "Unknown entity name: tutorial-flying-text" the moment a player edited a live depot's
 -- request. Put drones in flight for real, then swap the item and drive an update through.
+-- The "+N drones" buttons (script/drone_requests.lua) and the native blueprint drone request:
+-- request onto a built depot (item-request-proxy) and onto a ghost (insert_plan), the 100 cap,
+-- the "no recipe yet" refusal, blueprint capture of both, and a ghost revive carrying its request.
+local check_drone_requests = function()
+  local surface = refs.surface
+  local force = refs.force
+  local south = defines.direction.south
+
+  local pending_of = function(plans)
+    local sum = 0
+    for _, plan in pairs(plans or {}) do
+      if plan.id.name == "transport-drone" then
+        for _, pos in pairs(plan.items.in_inventory or {}) do sum = sum + (pos.count or 1) end
+      end
+    end
+    return sum
+  end
+  local expect = function(cond, msg) if not cond then error(msg, 2) end end
+
+  -- Clear a patch of land for these depots (generated terrain may have trees/water/rocks there).
+  surface.request_to_generate_chunks({36, 20}, 2)
+  surface.force_generate_chunk_requests()
+  local area = {{26, 14}, {48, 28}}
+  for _, e in pairs(surface.find_entities_filtered{area = area}) do
+    if e.valid and e.type ~= "character" then e.destroy() end
+  end
+  local land = {}
+  for x = 26, 47 do
+    for y = 14, 27 do
+      land[#land + 1] = {name = "grass-1", position = {x, y}}
+    end
+  end
+  surface.set_tiles(land, true, true, true, false)
+
+  -- One crafter_input slot really holds the full 100-drone limit (the requests all target stack 0).
+  local slot_test = build(surface, force, "request-depot", {30, 20}, south)
+  slot_test.set_recipe("request-iron-plate")
+  local inserted = slot_test.get_inventory(defines.inventory.crafter_input).insert{name = "transport-drone", count = 100}
+  expect(inserted == 100, "crafter_input took only " .. inserted .. " of 100 drones")
+
+  -- Built depot: proxy created, extended, capped at 100, then refused.
+  local real = build(surface, force, "request-depot", {36, 20}, south)
+  local added, err = drone_requests.request_drones(real, 10)
+  expect(added == nil and err == "drone-request-no-recipe", "request without a recipe wasn't refused: " .. tostring(added) .. " " .. tostring(err))
+  real.set_recipe("request-iron-plate")
+  real.get_inventory(defines.inventory.crafter_input).insert{name = "transport-drone", count = 30}
+  added = drone_requests.request_drones(real, 10)
+  expect(added == 10, "+10 added " .. tostring(added))
+  expect(real.item_request_proxy and pending_of(real.item_request_proxy.insert_plan) == 10, "proxy doesn't request 10")
+  added = drone_requests.request_drones(real, 100)
+  expect(added == 60, "+100 on 30 in depot + 10 pending should add 60, added " .. tostring(added))
+  expect(pending_of(real.item_request_proxy.insert_plan) == 70, "proxy doesn't request 70")
+  added, err = drone_requests.request_drones(real, 10)
+  expect(added == nil and err == "drone-request-full", "request past the cap wasn't refused")
+  expect(drone_requests.get_total_drone_count(real) == 100, "total isn't 100")
+
+  -- Inventory -> depot transfer (the slider "Insert" buttons). A script inventory stands in for
+  -- the player's main inventory.
+  local bag = game.create_inventory(20)
+  bag.insert{name = "transport-drone", count = 90}
+  local moved = drone_requests.transfer_drones(real, bag, 90)
+  expect(moved == 70, "drone transfer into 30/100 depot moved " .. moved .. " (expected 70)")
+  expect(bag.get_item_count("transport-drone") == 20, "drones not taken from the source inventory")
+  expect(real.get_inventory(defines.inventory.crafter_input).get_item_count("transport-drone") == 100, "depot doesn't hold 100 drones")
+  expect(pending_of(real.item_request_proxy and real.item_request_proxy.insert_plan) == 0, "pending drone request not trimmed after the depot filled up")
+  expect(drone_requests.transfer_drones(real, bag, 10) == 0, "drone transfer past the limit wasn't refused")
+
+  bag.insert{name = "iron-plate", count = 500, quality = "uncommon"}
+  expect(drone_requests.transfer_item(real, bag, 100) == 0, "wrong-quality item got transferred")
+  bag.insert{name = "iron-plate", count = 500}
+  moved = drone_requests.transfer_item(real, bag, 300)
+  expect(moved == 300, "item transfer moved " .. moved .. " (expected 300)")
+  expect(bag.get_item_count{name = "iron-plate", quality = "normal"} == 200, "items not taken from the source inventory")
+  expect(real.get_output_inventory().get_item_count{name = "iron-plate", quality = "normal"} >= 300, "items didn't land in the depot output")
+  -- More than 7 plain stacks (700): the result slots hold up to the recipe amount each.
+  bag.insert{name = "iron-plate", count = 1000}
+  moved = drone_requests.transfer_item(real, bag, 1200)
+  expect(moved == 1200, "item transfer past 7 stacks moved " .. moved .. " (expected 1200)")
+  bag.destroy()
+
+  -- Ghost: request goes into its insert plan.
+  local ghost = surface.create_entity{name = "entity-ghost", inner_name = "request-depot", position = {42, 20}, direction = south, force = force}
+  expect(ghost and ghost.valid, "couldn't place a request-depot ghost")
+  ghost.set_recipe("request-iron-plate")
+  added = drone_requests.request_drones(ghost, 10)
+  expect(added == 10, "ghost +10 added " .. tostring(added))
+  expect(pending_of(ghost.insert_plan) == 10, "ghost insert_plan doesn't request 10")
+
+  -- Blueprint capture: both the built depot (via the handler) and the ghost carry a native request.
+  -- A script inventory stands in for the player's cursor, so this runs headless too.
+  local inventory = game.create_inventory(1)
+  local stack = inventory[1]
+  stack.set_stack{name = "blueprint", count = 1}
+  local mapping = stack.create_blueprint{surface = surface, force = force, area = {{33, 16}, {45, 24}}, always_include_tiles = false}
+  depot_common.apply_blueprint_depot_data(stack, mapping, surface)
+  local found = {}
+  for _, bp in pairs(stack.get_blueprint_entities() or {}) do
+    found[#found + 1] = bp.name .. "=" .. pending_of(bp.items)
+  end
+  inventory.destroy()
+  table.sort(found)
+  local joined = table.concat(found, ",")
+  log("SELF_TEST: drone request blueprint entities: " .. joined)
+  expect(joined:find("request-depot=100", 1, true), "built depot's blueprint entry doesn't request 100 drones (" .. joined .. ")")
+  expect(joined:find("request-depot=10,", 1, true) or joined:sub(-#"request-depot=10") == "request-depot=10", "ghost's blueprint entry doesn't request 10 drones (" .. joined .. ")")
+
+  -- Reviving the ghost turns its insert plan into a real item-request-proxy.
+  local _, revived = ghost.revive{raise_revive = true}
+  expect(revived and revived.valid, "ghost didn't revive")
+  local proxy = revived.item_request_proxy
+  expect(proxy and pending_of(proxy.insert_plan) == 10, "revived depot has no 10-drone request")
+
+  -- Sliders set a target amount: lowering it takes things back out, limited by inventory room.
+  local bag2 = game.create_inventory(20)
+  local in_depot = function() return real.get_inventory(defines.inventory.crafter_input).get_item_count("transport-drone") end
+  expect(in_depot() == 100, "depot should hold 100 drones before the take-out test, has " .. in_depot())
+  local changed = drone_requests.set_drones(real, bag2, 40)
+  expect(changed == -60 and in_depot() == 40 and bag2.get_item_count("transport-drone") == 60, "lowering drones to 40 gave change " .. changed .. ", depot " .. in_depot())
+  local tiny = game.create_inventory(1) -- room for one stack of 10 drones only
+  changed = drone_requests.set_drones(real, tiny, 0)
+  expect(changed == -10 and in_depot() == 30, "take-out ignored the inventory room: change " .. changed .. ", depot " .. in_depot())
+  tiny.destroy()
+
+  local plates = function() return real.get_output_inventory().get_item_count{name = "iron-plate", quality = "normal"} end
+  local before = plates()
+  bag2.insert{name = "stone", count = 50 * 11} -- 6 drone + 11 stone slots of 20 full: room for 300 plates
+  changed = drone_requests.set_item(real, bag2, 0)
+  expect(changed == -300 and plates() == before - 300, "item take-out ignored the inventory room: change " .. changed)
+  bag2.destroy()
+
+  local ghost2 = surface.create_entity{name = "entity-ghost", inner_name = "request-depot", position = {42, 26}, direction = south, force = force}
+  ghost2.set_recipe("request-iron-plate")
+  drone_requests.set_drones(ghost2, nil, 50)
+  expect(pending_of(ghost2.insert_plan) == 50, "ghost request not set to 50")
+  drone_requests.set_drones(ghost2, nil, 5)
+  expect(pending_of(ghost2.insert_plan) == 5, "ghost request not lowered to 5")
+  ghost2.destroy()
+
+  log("SELF_TEST: drone requests ok")
+end
+
 local check_request_change_in_flight = function()
   local entity = refs.parameter_request
   if not (entity and entity.valid) then error("missing the depot for the in-flight request change check") end
@@ -785,6 +929,7 @@ local phases =
   -- Surface deletion is deferred by the engine (happens between ticks), so verify well after.
   [4800] = {name = "surface_deletion", run = check_surface_deletion},
   [5100] = {name = "request_change_in_flight", run = check_request_change_in_flight},
+  [5500] = {name = "drone_requests", run = check_drone_requests},
   [5900] = {name = "reservation_accounting", run = check_reservation_accounting},
 }
 

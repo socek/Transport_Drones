@@ -190,7 +190,8 @@ local make_fluid_request_recipe = function(fluid)
     categories = {category},
     order = fluid.order,
     subgroup = fluid.subgroup or "fluid",
-    overload_multiplier = 200,
+    -- Drone cap per depot = drone ingredient amount (1) * overload_multiplier -> 100, same as item requests.
+    overload_multiplier = 100,
     hide_from_player_crafting = true,
     hidden_in_factoriopedia = true,
     main_product = fluid.name,
@@ -223,10 +224,12 @@ local fuel_recipe =
   enabled = true,
   ingredients =
   {
-    {type = "item", name = "transport-drone", amount = 100},
+    {type = "item", name = "transport-drone", amount = 1},
     {type = "fluid", name = fuel, amount = 5000}
   },
-  overload_multiplier = 50,
+  -- Drone cap per depot = drone ingredient amount (1) * overload_multiplier -> 100, same as the other depots.
+  -- (The depot is disabled_by_script and never actually crafts, so the ingredient amount only sets the cap.)
+  overload_multiplier = 100,
   allow_quality = false,
   energy_required = 5,
   results =

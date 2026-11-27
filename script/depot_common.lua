@@ -1,6 +1,7 @@
 local transport_drone = require("script/transport_drone")
 local road_network = require("script/road_network")
 local transport_technologies = require("script/transport_technologies")
+local drone_requests = require("script/drone_requests")
 
 local depot_libs = {}
 
@@ -73,6 +74,7 @@ end
 local get_depot = function(entity)
   return get_depot_by_index(tostring(entity.unit_number))
 end
+drone_requests.set_depot_lookup(get_depot)
 
 
 local get_corpse_position = function(entity, corpse_offsets)
@@ -123,10 +125,13 @@ local attempt_to_place_node = function(entity, depot_lib)
   return false
 end
 
-local refund_build = function(event, entity_prototype)
+local refund_build = function(event, entity)
 
-  local item = entity_prototype.items_to_place_this[1]
-  if not item then return end
+  local place_item = entity.prototype.items_to_place_this[1]
+  if not place_item then return end
+  -- items_to_place_this carries no quality - refund the quality the entity was actually built at,
+  -- or a rejected uncommon+ depot came back as a normal one.
+  local item = {name = place_item.name, count = place_item.count or 1, quality = entity.quality.name}
 
   if event.player_index then
     game.get_player(event.player_index).insert(item)
@@ -203,7 +208,7 @@ local on_created_entity = function(event)
 
   if not attempt_to_place_node(entity, depot_lib) then
     --refund
-    refund_build(event, entity.prototype)
+    refund_build(event, entity)
     entity.destroy({raise_destroy = true})
     return
   end
@@ -374,17 +379,8 @@ local get_entity_tags = function(entity)
   return saver(depot)
 end
 
-local get_tags = function(blueprint_entity, surface)
-  local name = blueprint_entity.name
-  local lib = depot_libs[name]
-  if not lib then return end
 
-  local entity = surface.find_entity(name, blueprint_entity.position)
-  if not entity then return end
-
-  return get_entity_tags(entity)
-end
-
+local apply_blueprint_depot_data
 
 local on_player_setup_blueprint = function(event)
   local player = game.get_player(event.player_index)
@@ -396,28 +392,57 @@ local on_player_setup_blueprint = function(event)
     if not (item and item.valid_for_read) then return end
   end
 
-  local entities = item.get_blueprint_entities()
-  if not (entities and next(entities)) then return end
-
-  local surface = player.surface
-
   -- event.mapping (blueprint index -> source entity) is the authoritative link; the blueprint
   -- entities' own positions aren't guaranteed to be world coordinates, so position-based lookup
   -- only remains as a fallback for callers that can't provide a mapping (e.g. the self test
   -- invoking this handler directly with a synthetic event).
   local mapping = event.mapping and event.mapping.valid and event.mapping.get()
+  apply_blueprint_depot_data(item, mapping, player.surface)
+end
 
+-- Writes depot tags and drone requests into blueprint `item`. `mapping` is blueprint entity
+-- index -> source entity (nil to fall back to looking entities up by position on `surface`).
+apply_blueprint_depot_data = function(item, mapping, surface)
+  local entities = item.get_blueprint_entities()
+  if not (entities and next(entities)) then return end
+
+  local entities_changed = false
   for index, blueprint_entity in pairs(entities) do
     local tags
-    local source = mapping and mapping[index]
-    if source and source.valid and depot_libs[source.name] then
+    local source
+    if mapping then
+      source = mapping[index]
+      -- Ghosts of drone depots count too, so their requested drones survive re-blueprinting.
+      if not (source and source.valid and (depot_libs[source.name] or drone_requests.is_drone_depot(source))) then
+        source = nil
+      end
+    elseif depot_libs[blueprint_entity.name] then
+      source = surface.find_entity(blueprint_entity.name, blueprint_entity.position)
+    end
+    if source then
       tags = get_entity_tags(source)
-    else
-      tags = get_tags(blueprint_entity, surface)
     end
-    if tags then
-      item.set_blueprint_entity_tag(index, "transport_depot_tags", tags)
+
+    -- Drones go into the blueprint as a native item request rather than a tag: ghosts placed
+    -- from it then show the request and the engine delivers the drones itself. The count covers
+    -- drones already in the depot plus any still requested (see script/drone_requests.lua).
+    if source and drone_requests.is_drone_depot(source) then
+      if tags then tags.drone_count = nil end
+      local count = drone_requests.get_total_drone_count(source)
+      blueprint_entity.items = drone_requests.with_drone_plan(blueprint_entity.items, count)
+      if not next(blueprint_entity.items) then blueprint_entity.items = nil end
+      entities_changed = true
     end
+
+    if tags and next(tags) then
+      blueprint_entity.tags = blueprint_entity.tags or {}
+      blueprint_entity.tags.transport_depot_tags = tags
+      entities_changed = true
+    end
+  end
+
+  if entities_changed then
+    item.set_blueprint_entities(entities)
   end
 end
 
@@ -427,6 +452,7 @@ local lib = {}
 -- (everything else comes off player.cursor_stack/blueprint_to_setup), and it can't be raised
 -- through script.raise_event, so the test calls it directly with a synthetic event.
 lib.on_player_setup_blueprint = on_player_setup_blueprint
+lib.apply_blueprint_depot_data = apply_blueprint_depot_data
 
 lib.events =
 {

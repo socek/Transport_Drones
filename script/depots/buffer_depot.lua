@@ -114,10 +114,11 @@ function buffer_depot:remove_fuel(amount)
 end
 
 function buffer_depot:check_drone_validity()
+  -- Check every drone: returning on the first valid one (as this used to) left any invalid
+  -- drone that pairs() happened to visit later stuck in self.drones, still counted as "active"
+  -- and so permanently eating one of the depot's drone slots.
   for k, drone in pairs (self.drones) do
-    if drone.entity.valid then
-      return
-    else
+    if not drone.entity.valid then
       drone:clear_drone_data()
       self:remove_drone(drone)
     end
@@ -261,6 +262,16 @@ function buffer_depot:make_request()
   local request_size = self:get_request_size()
   local minimum_size = self:get_minimum_request_size()
   local stack_size = self:get_stack_size()
+
+  -- Same as request_depot:make_request - with a circuit request-size override, only fetch what's
+  -- still missing up to that limit. Without this the buffer always sent full-size requests, and
+  -- since process_pickup takes exactly requested_count under a circuit limit, it overshot the
+  -- limit by up to a whole drone load.
+  if self.circuit_limit then
+    local missing = self.circuit_limit - self:get_current_amount()
+    request_size = math.min(missing, request_size)
+    minimum_size = 1
+  end
 
   local node_position = self.node_position
   local heuristic = function(depot, count)

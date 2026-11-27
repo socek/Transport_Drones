@@ -570,6 +570,8 @@ road_network.get_depots_by_distance = function(id, category, node_position)
     return distance_squared(depot_a.node_position, node_position) < distance_squared(depot_b.node_position, node_position)
   end
   local network = get_network_by_id(id)
+  -- id is nil for a depot that couldn't join a network (road_network.add_depot found no node).
+  if not network then return end
   local depots = network.depots[category]
   if not depots then return end
 

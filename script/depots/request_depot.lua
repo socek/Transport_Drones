@@ -123,10 +123,11 @@ function request_depot:remove_fuel(amount)
 end
 
 function request_depot:check_drone_validity()
+  -- Check every drone: returning on the first valid one (as this used to) left any invalid
+  -- drone that pairs() happened to visit later stuck in self.drones, still counted as "active"
+  -- and so permanently eating one of the depot's drone slots.
   for k, drone in pairs (self.drones) do
-    if drone.entity.valid then
-      return
-    else
+    if not drone.entity.valid then
       drone:clear_drone_data()
       self:remove_drone(drone)
     end
@@ -638,4 +639,4 @@ function request_depot:on_config_changed()
   self.fuel_on_the_way = self.fuel_on_the_way or 0
 end
 
-return request_depot
+return request_depot
